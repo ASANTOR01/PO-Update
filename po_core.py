@@ -70,6 +70,7 @@ RE_ORDER = re.compile(r"^\d{2}[A-Z]{2,}[A-Z]*\d+$")                    # 26TRHK0
 RE_STYLE_NO = re.compile(r"^[A-Z0-9]+(?:\.[A-Z0-9]+){2,}$")             # I036893.3IT.GD.03
 RE_LEGACY_STYLE_HEADER = re.compile(r"^(?P<name>.+?)\s+-\s+(?P<code>\S+)$")
 RE_LEGACY_ETD = re.compile(r"(\d{1,2})\s+([A-Za-z]{3})\s+(\d{2,4})")    # 15 Oct 26
+RE_COLOR_PLACEHOLDER = re.compile(r"\s*-{2,}\s*$")                   # trailing "---" after a colour
 RE_BF_ETD = re.compile(r"Requested\s+ETD\s+(\d{1,2})\.(\d{1,2})\.(\d{4})")
 
 
@@ -335,7 +336,9 @@ def _parse_item_line(line, fmt: NumFmt, is_bf: bool, centers, color_zone_end,
     order_no, style_no, rest = line[0]["text"], line[1]["text"], line[2:]
 
     # Colour = everything left of the XS column (digits in a colour name are safe).
-    color = " ".join(w["text"] for w in rest if _center(w) < color_zone_end).strip()
+    color = " ".join(w["text"] for w in rest if _center(w) < color_zone_end)
+    # The BF layout prints '---' after colours that have no wash/dye text; drop it.
+    color = RE_COLOR_PLACEHOLDER.sub("", color).strip()
 
     # Sizes: numbers inside the size zone -> nearest header column.
     sizes = {s: 0 for s in SIZES}
@@ -407,20 +410,17 @@ def _reconcile(result: ParseResult) -> None:
 # DataFrame + Excel export
 # --------------------------------------------------------------------------- #
 def build_dataframe(results: list[ParseResult], blank_sizes_as_zero: bool = True,
-                    include_fabrication: bool = True, strip_dashes: bool = False) -> pd.DataFrame:
+                    include_fabrication: bool = True) -> pd.DataFrame:
     """
     Combine results into a DataFrame mirroring the template columns.
 
     blank_sizes_as_zero : False leaves blank PDF size cells empty.
     include_fabrication : False drops the 'Fabrication' column (original 14-col layout).
-    strip_dashes        : remove the '---' placeholder the BF layout prints after colours.
     """
     cols = COLUMNS_FULL if include_fabrication else COLUMNS_NO_FABRICATION
     rows = [{c: r.get(c) for c in cols} for res in results for r in res.rows]
     df = pd.DataFrame(rows, columns=cols)
     df = df.replace({"Fabrication": {"": None}})
-    if strip_dashes:
-        df["Color"] = df["Color"].str.replace(r"\s*---\s*$", "", regex=True).str.strip()
     if not blank_sizes_as_zero:
         for s in SIZES:
             df[s] = df[s].astype("object").where(df[s] != 0, None)

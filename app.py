@@ -39,8 +39,6 @@ with st.sidebar:
                                   "Untick to write the quantity printed on the PDF as a plain number.")
     zero_fill = st.checkbox("Write 0 for blank sizes", value=True,
                             help="Untick to leave blank PDF size cells empty in Excel.")
-    strip_dashes = st.checkbox("Remove '---' after colour names", value=False,
-                               help="The BF27… layout prints '---' when a colour has no wash/dye text.")
     lookup_hdrs = st.checkbox("Include lookup headers (right-hand block)", value=True,
                               help="The template's right-hand columns are XLOOKUPs into another workbook. "
                                    "Headers are reproduced; cells are left empty.")
@@ -96,7 +94,7 @@ if results:
                     st.write("•", w)
 
     df = build_dataframe(results, blank_sizes_as_zero=zero_fill,
-                         include_fabrication=fabrication, strip_dashes=strip_dashes)
+                         include_fabrication=fabrication)
     st.subheader(f"Preview ({len(df):,} rows)")
     st.dataframe(df, hide_index=True, use_container_width=True)
 
