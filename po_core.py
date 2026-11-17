@@ -458,6 +458,8 @@ def build_dataframe(results: list[ParseResult], blank_sizes_as_zero: bool = True
     rows = [{c: r.get(c) for c in cols} for res in results for r in res.rows]
     df = pd.DataFrame(rows, columns=cols)
     df = df.replace({"Fabrication": {"": None}})
+    # ETD as a plain date (no "00:00:00" time part) in the app preview and in Excel.
+    df["ETD"] = [d.date() if isinstance(d, datetime) else None for d in df["ETD"]]
     if strip_dashes:
         df["Color"] = df["Color"].str.replace(r"\s*---\s*$", "", regex=True).str.strip()
     if not blank_sizes_as_zero:
