@@ -1,6 +1,8 @@
 """
-po_core.py  (v2 - supports two buyer PO layouts)
+po_core.py  (v3 - supports two buyer PO layouts)
 ================================================
+v3: size header may show any run of sizes (e.g. XS S M L only for women's POs);
+    one PDF may contain several POs (TOTALs are added up, Dispatch No./ETD per PO).
 Core logic for the PO extractor: PDF parsing + Excel export.
 Free of any UI code so it can be tested / reused from a script.
 
@@ -70,7 +72,6 @@ RE_ORDER = re.compile(r"^\d{2}[A-Z]{2,}[A-Z]*\d+$")                    # 26TRHK0
 RE_STYLE_NO = re.compile(r"^[A-Z0-9]+(?:\.[A-Z0-9]+){2,}$")             # I036893.3IT.GD.03
 RE_LEGACY_STYLE_HEADER = re.compile(r"^(?P<name>.+?)\s+-\s+(?P<code>\S+)$")
 RE_LEGACY_ETD = re.compile(r"(\d{1,2})\s+([A-Za-z]{3})\s+(\d{2,4})")    # 15 Oct 26
-RE_COLOR_PLACEHOLDER = re.compile(r"\s*-{2,}\s*$")                   # trailing "---" after a colour
 RE_BF_ETD = re.compile(r"Requested\s+ETD\s+(\d{1,2})\.(\d{1,2})\.(\d{4})")
 
 
@@ -166,20 +167,36 @@ def _line_text(line: list[dict]) -> str:
 
 
 def _is_size_header(line: list[dict]) -> bool:
+    """
+    Table header line = a line carrying the size labels.
+
+    The size run varies by style: men's POs print XS..XXL, women's POs may print
+    only XS S M L (e.g. BF27E02002). So accept any 3+ distinct size labels, or
+    2+ when the line also carries the 'Order No.' column title.
+    """
     texts = [w["text"] for w in line]
-    return "XS" in texts and "XXL" in texts
+    found = {t for t in texts if t in SIZES}
+    return len(found) >= 3 or (len(found) >= 2 and "Order" in texts)
 
 
 def _size_header_centers(line: list[dict]) -> Optional[tuple[dict, float]]:
-    """({size: x_center}, column_pitch) for a header line, else None."""
+    """
+    ({size: x_center}, column_pitch) for the sizes actually printed in a header
+    line (any subset of SIZES, in order), else None.
+    """
     centers: dict[str, float] = {}
     for w in line:
         if w["text"] in SIZES and w["text"] not in centers:
             centers[w["text"]] = _center(w)
-    if len(centers) != len(SIZES):
+    present = [s for s in SIZES if s in centers]
+    if len(present) < 2:
         return None
-    xs = [centers[s] for s in SIZES]
-    return centers, (xs[-1] - xs[0]) / (len(xs) - 1)
+    xs = [centers[s] for s in present]
+    if any(b <= a for a, b in zip(xs, xs[1:])):      # labels must run left -> right
+        return None
+    first_i, last_i = SIZES.index(present[0]), SIZES.index(present[-1])
+    pitch = (xs[-1] - xs[0]) / (last_i - first_i)
+    return {s: centers[s] for s in present}, pitch
 
 
 def detect_layout(pages_text: list[str]) -> str:
@@ -228,13 +245,17 @@ def _parse_pages(pages: list[list[list[dict]]], layout: str, filename: str) -> P
     fmt = FMT_BF if is_bf else FMT_LEGACY
     result = ParseResult(file_label=file_label_from_name(filename), layout=layout)
 
-    # State carried across pages: a style block can span a page break, and the
-    # size header is re-printed on every page (but we keep the last one as fallback).
+    # State carried across pages: a style block can span a page break. The size
+    # header is re-printed on every table page and can differ between POs
+    # (XS..XXL vs XS..L), so it is re-read every time a header line appears.
+    # One PDF may also hold several POs back to back (e.g. "Lot 2" + "Lot HKDC"),
+    # each with its own Dispatch No. / Requested ETD / TOTAL.
     style = fabrication = ""
-    last_header = None
+    header = None
     etd: Optional[datetime] = None
     block_pcs, block_amt = 0, 0.0           # running totals since last Subtotal
     dispatch_no = None
+    total_pcs, total_amt, totals_seen = 0, 0.0, 0
 
     for page_no, lines in enumerate(pages, start=1):
         # ---- page-level fields (BF layout only) ---------------------------
@@ -248,18 +269,8 @@ def _parse_pages(pages: list[list[list[dict]]], layout: str, filename: str) -> P
                         etd = datetime(y, mo, d)
                     except ValueError:
                         result.warnings.append(f"Page {page_no}: invalid Requested ETD '{m.group(0)}'.")
-                if dispatch_no is None and line[0]["text"] == "Dispatch" and len(line) > 2 \
-                        and line[1]["text"] == "No.":
+                if line[0]["text"] == "Dispatch" and len(line) > 2 and line[1]["text"] == "No.":
                     dispatch_no = line[2]["text"]
-
-        header = next(filter(None, (_size_header_centers(l) for l in lines if _is_size_header(l))), None) \
-            or last_header
-        if header is None:
-            continue                          # page without a table (e.g. terms page)
-        last_header = header
-        centers, pitch = header
-        color_zone_end = centers["XS"] - pitch / 2     # left edge of XS column
-        size_zone_end = centers["XXL"] + pitch / 2     # right edge of XXL column
 
         in_table = False
         for line in lines:
@@ -268,17 +279,25 @@ def _parse_pages(pages: list[list[list[dict]]], layout: str, filename: str) -> P
 
             # ---- table boundaries ----------------------------------------
             if _is_size_header(line):
-                in_table = True
+                parsed = _size_header_centers(line)
+                if parsed:
+                    header = parsed
+                    in_table = True
+                else:
+                    result.warnings.append(f"Page {page_no}: could not read the size header '{text}'.")
                 continue
-            if not in_table:
+            if not in_table or header is None:
                 continue
 
             # ---- Sub total / TOTAL (used for reconciliation only) ---------
             if first.lower() in ("sub", "subtotal") or first.upper() == "TOTAL":
                 nums = _read_totals(line, fmt)
                 if first.upper() == "TOTAL":
-                    if nums:
-                        result.printed_total_pcs, result.printed_total_amount = nums
+                    if nums:                    # add up when the PDF holds several POs
+                        total_pcs += nums[0]
+                        total_amt += nums[1]
+                        totals_seen += 1
+                    block_pcs, block_amt = 0, 0.0
                     in_table = False            # nothing after TOTAL is table data
                 elif nums:
                     if block_pcs != nums[0] or abs(block_amt - nums[1]) > 1.0:
@@ -292,11 +311,11 @@ def _parse_pages(pages: list[list[list[dict]]], layout: str, filename: str) -> P
 
             # ---- item row --------------------------------------------------
             if RE_ORDER.match(first) and len(line) > 1 and RE_STYLE_NO.match(line[1]["text"]):
-                row = _parse_item_line(line, fmt, is_bf, centers, color_zone_end,
-                                       size_zone_end, etd, result, page_no)
+                row = _parse_item_line(line, fmt, is_bf, header, etd, result, page_no)
                 if row:
                     row["Sty"], row["Fabrication"] = style, fabrication
                     row["File"] = result.file_label
+                    row["_dispatch"] = dispatch_no
                     result.rows.append(row)
                     block_pcs += row["Pc"]
                     block_amt += row["Pc"] * row["Price"]
@@ -313,10 +332,21 @@ def _parse_pages(pages: list[list[list[dict]]], layout: str, filename: str) -> P
                     style = f"{m.group('name')}{STYLE_JOINER}- {m.group('code')}"
                     fabrication = ""
 
+    if totals_seen:
+        result.printed_total_pcs = total_pcs
+        result.printed_total_amount = round(total_amt, 2)
+
     if is_bf:
-        result.file_label = _bf_label(dispatch_no, filename)
+        labels = []
         for r in result.rows:
-            r["File"] = result.file_label
+            r["File"] = _bf_label(r["_dispatch"], filename)
+            labels.append(r["File"])
+        if labels:
+            result.file_label = ", ".join(dict.fromkeys(labels))   # unique, in order
+        else:
+            result.file_label = _bf_label(dispatch_no, filename)
+    for r in result.rows:
+        r.pop("_dispatch", None)
 
     _reconcile(result)
     return result
@@ -330,22 +360,28 @@ def _read_totals(line: list[dict], fmt: NumFmt) -> Optional[tuple[int, float]]:
     return (pcs, amt) if pcs is not None and amt is not None else None
 
 
-def _parse_item_line(line, fmt: NumFmt, is_bf: bool, centers, color_zone_end,
-                     size_zone_end, etd_page, result: ParseResult, page_no: int) -> Optional[dict]:
+def _parse_item_line(line, fmt: NumFmt, is_bf: bool, header, etd_page,
+                     result: ParseResult, page_no: int) -> Optional[dict]:
     """Turn one visual line of the table into a row dict."""
     order_no, style_no, rest = line[0]["text"], line[1]["text"], line[2:]
 
-    # Colour = everything left of the XS column (digits in a colour name are safe).
-    color = " ".join(w["text"] for w in rest if _center(w) < color_zone_end)
-    # The BF layout prints '---' after colours that have no wash/dye text; drop it.
-    color = RE_COLOR_PLACEHOLDER.sub("", color).strip()
+    # Size zone = from the left edge of the first printed size column to the
+    # right edge of the last one (XS..XXL, or e.g. XS..L for women's POs).
+    centers, pitch = header
+    present = list(centers)                        # already in SIZES order
+    color_zone_end = centers[present[0]] - pitch / 2
+    size_zone_end = centers[present[-1]] + pitch / 2
 
-    # Sizes: numbers inside the size zone -> nearest header column.
+    # Colour = everything left of the first size column (digits in a colour name are safe).
+    color = " ".join(w["text"] for w in rest if _center(w) < color_zone_end).strip()
+
+    # Sizes: numbers inside the size zone -> nearest printed header column.
+    # Sizes not printed on this PO (e.g. XL/XXL) stay 0.
     sizes = {s: 0 for s in SIZES}
     collision = False
     for w in rest:
         if color_zone_end <= _center(w) < size_zone_end and fmt.re_int.match(w["text"]):
-            nearest = min(SIZES, key=lambda s: abs(centers[s] - _center(w)))
+            nearest = min(present, key=lambda s: abs(centers[s] - _center(w)))
             collision |= bool(sizes[nearest])
             sizes[nearest] = fmt.to_int(w["text"])
     if collision:
@@ -410,17 +446,20 @@ def _reconcile(result: ParseResult) -> None:
 # DataFrame + Excel export
 # --------------------------------------------------------------------------- #
 def build_dataframe(results: list[ParseResult], blank_sizes_as_zero: bool = True,
-                    include_fabrication: bool = True) -> pd.DataFrame:
+                    include_fabrication: bool = True, strip_dashes: bool = False) -> pd.DataFrame:
     """
     Combine results into a DataFrame mirroring the template columns.
 
     blank_sizes_as_zero : False leaves blank PDF size cells empty.
     include_fabrication : False drops the 'Fabrication' column (original 14-col layout).
+    strip_dashes        : remove the '---' placeholder the BF layout prints after colours.
     """
     cols = COLUMNS_FULL if include_fabrication else COLUMNS_NO_FABRICATION
     rows = [{c: r.get(c) for c in cols} for res in results for r in res.rows]
     df = pd.DataFrame(rows, columns=cols)
     df = df.replace({"Fabrication": {"": None}})
+    if strip_dashes:
+        df["Color"] = df["Color"].str.replace(r"\s*---\s*$", "", regex=True).str.strip()
     if not blank_sizes_as_zero:
         for s in SIZES:
             df[s] = df[s].astype("object").where(df[s] != 0, None)
