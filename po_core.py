@@ -158,6 +158,39 @@ def _group_lines(words: list[dict], tol: float = 3.5) -> list[list[dict]]:
     return [sorted(l, key=lambda w: w["x0"]) for l in lines]
 
 
+def _split_merged_numbers(words: list[dict]) -> list[dict]:
+    """
+    Undo pdfplumber gluing neighbouring numbers together.
+
+    Size columns are only ~21pt apart, so two 4-digit quantities such as
+    "1.460" and "1.231" end up ~2pt apart - closer than pdfplumber's default
+    3pt word gap - and come out as ONE word "1.4601.231", which is not a valid
+    number and was silently skipped. Characters inside one number touch
+    (gap ~0), so we split any word containing digits wherever two consecutive
+    characters are separated by a visible gap.
+    """
+    out: list[dict] = []
+    for w in words:
+        chars = w.pop("chars", None)
+        if not chars or not any(ch.isdigit() for ch in w["text"]):
+            out.append(w)
+            continue
+        groups = [[chars[0]]]
+        for prev, ch in zip(chars, chars[1:]):
+            gap_limit = max(0.5, 0.06 * float(ch.get("size") or 8))   # ~0.5pt at 8pt text
+            if ch["x0"] - prev["x1"] > gap_limit:
+                groups.append([ch])
+            else:
+                groups[-1].append(ch)
+        if len(groups) == 1:
+            out.append(w)
+            continue
+        for g in groups:
+            out.append({**w, "text": "".join(c["text"] for c in g),
+                        "x0": g[0]["x0"], "x1": g[-1]["x1"]})
+    return out
+
+
 def _center(w: dict) -> float:
     return (w["x0"] + w["x1"]) / 2
 
@@ -221,8 +254,9 @@ def parse_po_pdf(source: BinaryIO | str, filename: str) -> ParseResult:
     with pdfplumber.open(source) as pdf:
         pages = []
         for page in pdf.pages:
-            words = page.extract_words(keep_blank_chars=False, use_text_flow=False)
-            pages.append(_group_lines(words))
+            words = page.extract_words(keep_blank_chars=False, use_text_flow=False,
+                                       return_chars=True)
+            pages.append(_group_lines(_split_merged_numbers(words)))
 
     first = detect_layout([" ".join(_line_text(l) for l in lines) for lines in pages])
     other = LAYOUT_BF if first == LAYOUT_LEGACY else LAYOUT_LEGACY
@@ -380,10 +414,16 @@ def _parse_item_line(line, fmt: NumFmt, is_bf: bool, header, etd_page,
     sizes = {s: 0 for s in SIZES}
     collision = False
     for w in rest:
-        if color_zone_end <= _center(w) < size_zone_end and fmt.re_int.match(w["text"]):
+        if not (color_zone_end <= _center(w) < size_zone_end):
+            continue
+        if fmt.re_int.match(w["text"]):
             nearest = min(present, key=lambda s: abs(centers[s] - _center(w)))
             collision |= bool(sizes[nearest])
             sizes[nearest] = fmt.to_int(w["text"])
+        elif any(ch.isdigit() for ch in w["text"]):
+            # Never drop a quantity silently.
+            result.warnings.append(
+                f"{order_no}: could not read size value '{w['text']}' (page {page_no}).")
     if collision:
         result.warnings.append(f"{order_no}: two numbers mapped to the same size column (page {page_no}).")
 
